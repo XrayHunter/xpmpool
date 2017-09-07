@@ -25,10 +25,11 @@ PoolBackend::PoolBackend(CWallet* pwallet) {
 	
 	mPoolAddress = GetArg("-feeaddr", "POOLFEE_ADDRESS");
 	
-	mCtx = zctx_new();
-	
-	mPipe = zthread_fork(mCtx, &PoolBackend::InvokeThread, this);
-	
+	mPipe = zsock_new_router("tcp://*:8888");
+	assert(mPipe);
+
+PoolBackend::InvokeThread(mPipe, this);
+
 	std::string dbconn;
 	{
 		std::ostringstream ss;
@@ -86,11 +87,8 @@ PoolBackend::PoolBackend(CWallet* pwallet) {
 
 PoolBackend::~PoolBackend() {
 	
-	zsocket_signal(mPipe);
-	zsocket_wait(mPipe);
-	
-	zctx_destroy(&mCtx);
-	
+	zsock_destroy(&mPipe);
+
 	//mSession->flush();
 	delete mSession;
 	delete mBackend;
@@ -100,27 +98,26 @@ PoolBackend::~PoolBackend() {
 }
 
 
-void PoolBackend::InvokeThread(void *arg, zctx_t *ctx, void *pipe) {
+void PoolBackend::InvokeThread(zsock_t *pipe, void *arg) {
 	
-	((PoolBackend*)arg)->ThreadLoop(ctx, pipe);
+	((PoolBackend*)arg)->ThreadLoop(pipe);
 	
 }
 
 
-void PoolBackend::ThreadLoop(zctx_t *ctx, void *pipe) {
+void PoolBackend::ThreadLoop(void *pipe) {
 	
-	void* router = zsocket_new(ctx, ZMQ_ROUTER);
-	zsocket_bind(router, "tcp://*:8888");
-	
-	zsocket_set_rcvhwm(router, 1*1000*1000);
+	zsock_t* router = zsock_new_router("tcp://*:8888");
+		
+//	zsocket_set_rcvhwm(router, 1*1000*1000); 
 	
 	zloop_t* wloop = zloop_new();
 	
-	zmq_pollitem_t item_input = {router, 0, ZMQ_POLLIN, 0};
+	zmq_pollitem_t item_input = {zsock_resolve(router), 0, ZMQ_POLLIN, 0};
 	int err = zloop_poller(wloop, &item_input, &PoolBackend::InvokeInput, this);
 	assert(!err);
 	
-	zmq_pollitem_t item_pipe = {pipe, 0, ZMQ_POLLIN, 0};
+	zmq_pollitem_t item_pipe = {zsock_resolve(pipe), 0, ZMQ_POLLIN, 0};
 	err = zloop_poller(wloop, &item_pipe, &PoolBackend::InvokeShutdown, this);
 	assert(!err);
 	
@@ -131,11 +128,11 @@ void PoolBackend::ThreadLoop(zctx_t *ctx, void *pipe) {
 	
 	zloop_destroy(&wloop);
 	
-	zsocket_destroy(ctx, router);
+	zsock_destroy(&router);
 	
 	printf("PoolBackend shutdown.\n");
 	
-	zsocket_signal(pipe);
+	zsock_signal(pipe,0);
 	
 }
 
@@ -650,12 +647,3 @@ int PoolBackend::HandleData(zmq_pollitem_t *item) {
 	return 0;
 	
 }
-
-
-
-
-
-
-
-
-
