@@ -14,7 +14,7 @@
 
 
 
-void thread_test_inv(void* args, zctx_t *ctx, void *pipe);
+void thread_test_inv(zsock_t *pipe, void* args);
 
 
 
@@ -56,9 +56,9 @@ PrimeWorker::PrimeWorker(CWallet* pwallet, unsigned threadid, unsigned target)
 }
 
 
-void PrimeWorker::InvokeWork(void *args, zctx_t *ctx, void *pipe){
+void PrimeWorker::InvokeWork(zsock_t *pipe, void *args){
 	
-	((PrimeWorker*)args)->Work(ctx, pipe);
+	((PrimeWorker*)args)->Work(pipe);
 	
 }
 
@@ -86,72 +86,70 @@ int PrimeWorker::InvokeTimerFunc(zloop_t *wloop, int timer_id, void *arg) {
 	
 }
 
+int PrimeWorker::zactor_term(zloop_t *wloop, zsock_t *pipe, void *arg) {
+	char *msg = zstr_recv(pipe);
+	if (msg && !strcmp("$TERM", msg)) {
+		free(msg);
+		return -1;
+	}
+	free(msg);
+	return 0;
+}
 
-void PrimeWorker::Work(zctx_t *ctx, void *pipe) {
-	
+void PrimeWorker::Work(zsock_t *pipe) {	
 	printf("PrimeWorker started.\n");
 	
-	mBackend = zsocket_new(ctx, ZMQ_DEALER);
-	void* frontend = zsocket_new(ctx, ZMQ_DEALER);
-	void* input = zsocket_new(ctx, ZMQ_SUB);
-	mServer = zsocket_new(ctx, ZMQ_ROUTER);
-	mSignals = zsocket_new(ctx, ZMQ_PUB);
+	char endpoint [32];
+	sprintf(endpoint, "tcp://*:%d", mServerPort);
+	mServer = zsock_new_router(endpoint);
+	assert (mServer);
+	sprintf(endpoint, "tcp://*:%d", mSignalPort);
+	mSignals = zsock_new_pub(endpoint);
+	assert (mSignals);
+	mBackend = zsock_new_dealer("tcp://localhost:8888");
+	assert (mBackend);
+
+	zsock_t *frontend = zsock_new_dealer("tcp://localhost:7777");
+	assert (frontend);
+	zsock_t *input = zsock_new_sub("inproc://bitcoin", "\1");
+	assert (input);
 	
-	zsocket_set_sndhwm(mBackend, 1*1000*1000);
+/*	zsocket_set_sndhwm(mBackend, 1*1000*1000);  */
 	
-	int err = 0;
-	err = zsocket_bind(mServer, "tcp://*:%d", mServerPort);
-	if(!err)
-		printf("zsocket_bind(mServer, tcp://*:*) failed.\n");
 	
-	err = zsocket_bind(mSignals, "tcp://*:%d", mSignalPort);
-	if(!err)
-		printf("zsocket_bind(mSignals, tcp://*:*) failed.\n");
 	
 	printf("PrimeWorker: mServerPort=%d mSignalPort=%d\n", mServerPort, mSignalPort);
-	
-	err = zsocket_connect(mBackend, "tcp://localhost:8888");
-	assert(!err);
-	
-	err = zsocket_connect(frontend, "tcp://localhost:7777");
-	assert(!err);
-	
-	err = zsocket_connect(input, "inproc://bitcoin");
-	assert(!err);
-	
-	const char one[2] = {1, 0};
-	zsocket_set_subscribe(input, one);
-	
+		
 	zloop_t* wloop = zloop_new();
 	
-	zmq_pollitem_t item_input = {input, 0, ZMQ_POLLIN, 0};
-	err = zloop_poller(wloop, &item_input, &PrimeWorker::InvokeInput, this);
+	zmq_pollitem_t item_input = {zsock_resolve(input), 0, ZMQ_POLLIN, 0};
+	int err = zloop_poller(wloop, &item_input, &PrimeWorker::InvokeInput, this);
 	assert(!err);
 	
-	zmq_pollitem_t item_server = {mServer, 0, ZMQ_POLLIN, 0};
+	zmq_pollitem_t item_server = {zsock_resolve(mServer), 0, ZMQ_POLLIN, 0};
 	err = zloop_poller(wloop, &item_server, &PrimeWorker::InvokeRequest, this);
 	assert(!err);
 	
-	zmq_pollitem_t item_frontend = {frontend, 0, ZMQ_POLLIN, 0};
+	zmq_pollitem_t item_frontend = {zsock_resolve(frontend), 0, ZMQ_POLLIN, 0};
 	err = zloop_poller(wloop, &item_frontend, &PrimeWorker::InvokeRequest, this);
 	assert(!err);
 	
 	err = zloop_timer(wloop, 60000, 0, &PrimeWorker::InvokeTimerFunc, this);
 	assert(err >= 0);
 	
-	zsocket_signal(pipe);
+	err = zloop_reader(wloop, pipe, &PrimeWorker::zactor_term, NULL);
+
+	zsock_signal(pipe, 0);
 	
 	zloop_start(wloop);
 	
 	zloop_destroy(&wloop);
 	
-	zsocket_destroy(ctx, mServer);
-	zsocket_destroy(ctx, mSignals);
-	zsocket_destroy(ctx, mBackend);
-	zsocket_destroy(ctx, frontend);
-	zsocket_destroy(ctx, input);
-	
-	zsocket_signal(pipe);
+	zsock_destroy(&mServer);
+	zsock_destroy(&mSignals);
+	zsock_destroy(&mBackend);
+	zsock_destroy(&frontend);
+	zsock_destroy(&input);
 	
 	printf("PrimeWorker exited.\n");
 	
@@ -644,49 +642,26 @@ PoolFrontend::PoolFrontend(unsigned port) {
 	
 	printf("PoolFrontend started on port %d.\n", port);
 	
-	mCtx = zctx_new();
+	mPort = port;
 	
-	mDealer = zsocket_new(mCtx, ZMQ_DEALER);
-	mRouter = zsocket_new(mCtx, ZMQ_ROUTER);
-	
-	zsocket_bind(mDealer, "tcp://*:7777");
-	unsigned ret = zsocket_bind(mRouter, "tcp://*:%d", port);
-	if(ret != port){
-		printf("Frontend: ERROR: zsocket_bind failed.\n");
-		exit(-1);
-	}
-	
-	zthread_fork(mCtx, &PoolFrontend::InvokeProxy, this);
-	
+	mPipe = zactor_new(zproxy, this);
+	zstr_sendx(mPipe, "FRONTEND", "DEALER", "tcp://*:7777", NULL);
+	zsock_wait(mPipe);
+	char endpoint [32];
+	sprintf(endpoint, "tcp://*:%d", mPort);
+	zstr_sendx(mPipe, "BACKEND", "ROUTER", endpoint, NULL);
+	zsock_wait(mPipe);
+
 }
 
 PoolFrontend::~PoolFrontend() {
 	
+	zactor_destroy (&mPipe);
 	printf("PoolFrontend stopped.\n");
 	
-	zsocket_destroy(mCtx, mRouter);
-	zsocket_destroy(mCtx, mDealer);
-	
-	zctx_destroy(&mCtx);
-	
+	zsock_destroy(&mRouter);
+	zsock_destroy(&mDealer);
 }
-
-
-void PoolFrontend::InvokeProxy(void *arg, zctx_t *ctx, void *pipe) {
-	
-	((PoolFrontend*)arg)->ProxyLoop();
-	
-}
-
-void PoolFrontend::ProxyLoop() {
-	
-	zmq_proxy(mRouter, mDealer, 0);
-	
-	printf("PoolFrontend shutdown.\n");
-	
-}
-
-
 
 
 PoolServer::PoolServer(CWallet* pwallet) {
@@ -696,13 +671,10 @@ PoolServer::PoolServer(CWallet* pwallet) {
 	mWallet = pwallet;
 	
 	mBackend = new PoolBackend(pwallet);
-	
-	mCtx = zctx_new();
-	
-	mWorkerSignals = zsocket_new(mCtx, ZMQ_PUB);
-	zsocket_bind(mWorkerSignals, "inproc://bitcoin");
-	
 	mBackendDealer = 0;
+	
+	mWorkerSignals = zsock_new_pub("inproc://bitcoin");
+	assert(mWorkerSignals);
 	
 	mMinShare = mBackend->Settings().MinShare;
 	mTarget = mBackend->Settings().Target;
@@ -712,8 +684,7 @@ PoolServer::PoolServer(CWallet* pwallet) {
 		
 		PrimeWorker* worker = new PrimeWorker(mWallet, i, mTarget);
 		
-		void* pipe = zthread_fork(mCtx, &PrimeWorker::InvokeWork, worker);
-		zsocket_wait(pipe);
+		zactor_t* pipe = zactor_new(&PrimeWorker::InvokeWork, worker);
 		
 		mWorkers.push_back(std::make_pair(worker, pipe));
 		
@@ -721,11 +692,11 @@ PoolServer::PoolServer(CWallet* pwallet) {
 	
 	mFrontend = new PoolFrontend(GetArg("-frontport", 6666));
 	
-	if(GetArg("-testinv", 0)){
+/*	if(GetArg("-testinv", 0)){
 		printf("STARTING TESTINV!!!\n");
-		zthread_fork(mCtx, &thread_test_inv, (void*)GetArg("-testinv", 0));
+		zactor_new(&thread_test_inv, (void*)GetArg("-testinv", 0));
 	}
-	
+*/	
 }
 
 PoolServer::~PoolServer(){
@@ -739,16 +710,14 @@ PoolServer::~PoolServer(){
 	
 	for(unsigned i = 0; i < mWorkers.size(); ++i){
 		
-		zsocket_wait(mWorkers[i].second);
+		zsock_wait(mWorkers[i].second);
 		delete mWorkers[i].first;
 		
 	}
 	
 	delete mFrontend;
 	delete mBackend;
-	
-	zsocket_destroy(mCtx, mWorkerSignals);
-	zctx_destroy(&mCtx);
+	zsock_destroy(&mWorkerSignals);
 	
 	printf("PoolServer stopped.\n");
 	
@@ -774,7 +743,7 @@ void PoolServer::NotifyNewBlock(CBlockIndex* pindex) {
 }
 
 
-void PoolServer::SendSignal(proto::Signal& sig, void* socket) {
+void PoolServer::SendSignal(proto::Signal& sig, zsock_t* socket) {
 	
 	size_t fsize = sig.ByteSize()+1;
 	zframe_t* frame = zframe_new(0, fsize);
@@ -798,7 +767,7 @@ PrimeServer* PrimeServer::CreateServer(CWallet* pwallet) {
 
 
 template<class C>
-static void Send(const C& req, void* socket) {
+static void Send(const C& req, zsock_t* socket) {
 	
 	zmsg_t* msg = zmsg_new();
 	size_t fsize = req.ByteSize();
@@ -838,15 +807,16 @@ inline void setRandStr(std::string* str, int size) {
 	
 }
 
-void thread_test_inv(void* args, zctx_t *ctx, void *pipe) {
+/*void thread_test_inv(zsock_t *pipe, void* args) {
 	
 	int param = (uint64)args;
 	
-	void* server = zsocket_new(ctx, ZMQ_DEALER);
-	
+	char endpoint [32];
+	sprintf(endpoint, "tcp://localhost:%d", param);
+
+	server = zsock_new_dealer(endpoint);
+	assert(server);
 	printf("thread_test_inv: port = %d\n", param);
-	int err = zsocket_connect(server, "tcp://localhost:%d", param);
-	assert(!err);
 	
 	static const unsigned maxsize = 1024;
 	unsigned char buffer[maxsize+10];
@@ -867,51 +837,6 @@ void thread_test_inv(void* args, zctx_t *ctx, void *pipe) {
 		zmsg_append(msg, &frame);
 		zmsg_send(&msg, server);
 		
-		/*if(invcount % 2 == 0){
-			
-			req.set_type(proto::Request::SHARE);
-			req.set_reqid(1);
-			GetNewReqNonce(req);
-			req.set_version(10);
-			req.set_height(1337);
-			
-			proto::Share* share = req.mutable_share();
-			setRandStr(share->mutable_addr(), rand()%32);
-			setRandStr(share->mutable_name(), rand()%32);
-			setRandStr(share->mutable_hash(), rand()%32);
-			setRandStr(share->mutable_merkle(), rand()%32);
-			setRandStr(share->mutable_multi(), rand()%50);
-			setRandStr(share->mutable_blockhash(), rand()%40);
-			share->set_clientid(1313);
-			share->set_bits(3444);
-			share->set_length(10);
-			share->set_chaintype(1);
-			share->set_height(2334);
-			share->set_isblock(true);
-			share->set_nonce(333434);
-			
-		}else{
-			
-			req.set_type(proto::Request::STATS);
-			req.set_reqid(1);
-			GetNewReqNonce(req);
-			req.set_version(10);
-			req.set_height(1337);
-			
-			proto::ClientStats* stats = req.mutable_stats();
-			setRandStr(stats->mutable_addr(), rand()%32);
-			setRandStr(stats->mutable_name(), rand()%32);
-			stats->set_clientid(345345);
-			stats->set_instanceid(34344555);
-			stats->set_version(10);
-			stats->set_latency(445);
-			stats->set_ngpus(4);
-			stats->set_height(433435);
-			
-		}
-		
-		Send(req, server);*/
-		
 		if(zctx_interrupted)
 			break;
 		
@@ -921,16 +846,6 @@ void thread_test_inv(void* args, zctx_t *ctx, void *pipe) {
 		
 	}
 	
-	zsocket_destroy(ctx, server);
+	zsock_destroy(&server);
 	
-}
-
-
-
-
-
-
-
-
-
-
+}*/
